@@ -42,7 +42,7 @@ brew install portaudio
 ## Quick start
 
 ```bash
-git clone https://github.com/AssemblyAI/voice-agent-websocket-universal-3-pro
+git clone https://github.com/kelseyefoster/voice-agent-websocket-universal-3-pro
 cd voice-agent-websocket-universal-3-pro
 
 python -m venv .venv && source .venv/bin/activate
