@@ -1,29 +1,33 @@
 """
-Zero-framework voice agent — raw WebSocket to AssemblyAI Universal-3 Pro Streaming.
+Zero-framework voice agent — raw WebSocket to AssemblyAI Universal-3.5 Pro Streaming.
 
 This tutorial shows exactly what's happening under the hood:
-  Mic ──► sounddevice ──► AssemblyAI U3 Pro WebSocket ──► GPT-4o ──► ElevenLabs ──► speakers
+  Mic ──► sounddevice ──► AssemblyAI Universal-3.5 Pro WebSocket ──► GPT-4o ──► ElevenLabs ──► speakers
 
 No LiveKit, no Pipecat, no Vapi — just raw WebSockets and Python.
 Great for understanding the full pipeline or embedding into any custom app.
+
+The one feature worth calling out: after every agent reply we push the spoken
+text back to AssemblyAI as `agent_context` via an UpdateConfiguration message.
+The model then transcribes the user's next turn *in the context of what the
+agent just said*, which is where Universal-3.5 Pro's ~10% WER reduction on
+voice-agent audio comes from.
 
 Run: python agent.py
 """
 
 import asyncio
-import base64
 import json
 import os
 import queue
 import sys
-import threading
 
 import httpx
-import sounddevice as sd
 import numpy as np
+import sounddevice as sd
 import websockets
-from openai import AsyncOpenAI
 from dotenv import load_dotenv
+from openai import AsyncOpenAI
 
 load_dotenv()
 
@@ -33,22 +37,32 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 ELEVENLABS_API_KEY = os.environ["ELEVENLABS_API_KEY"]
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
 
-SAMPLE_RATE = 16000       # 16kHz PCM — optimal for U3 Pro
+SAMPLE_RATE = 16000       # 16 kHz PCM
 CHANNELS = 1
-CHUNK_MS = 100            # Send 100ms audio chunks
+CHUNK_MS = 50             # ~50 ms audio chunks (recommended block size)
 CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_MS / 1000)
 
-# Universal-3 Pro Streaming WebSocket URL
+SPEECH_MODEL = "universal-3-5-pro"
+
+# Universal-3.5 Pro Streaming WebSocket URL.
+# Turn detection on Universal-3.5 Pro is punctuation-based and driven by the
+# `mode` preset (min_latency | balanced | max_accuracy) plus the silence
+# windows below — there is no end_of_turn_confidence_threshold on this model.
 AAI_WS_URL = (
     "wss://streaming.assemblyai.com/v3/ws"
-    "?speech_model=u3-rt-pro"
-    "&encoding=pcm_s16le"
+    f"?speech_model={SPEECH_MODEL}"
+    "&encoding=pcm_s16le"           # 16-bit signed little-endian PCM
     f"&sample_rate={SAMPLE_RATE}"
-    "&end_of_turn_confidence_threshold=0.4"
-    "&min_turn_silence=300"
-    "&max_turn_silence=1200"
-    f"&token={ASSEMBLYAI_API_KEY}"
+    "&mode=balanced"                # balanced | min_latency | max_accuracy
+    "&min_turn_silence=400"         # speculative end-of-turn check (ms)
+    "&max_turn_silence=1600"        # hard cap before the turn is forced to end (ms)
+    # "&voice_focus=near-field"     # (optional, +$0.10/hr) isolate the primary speaker
 )
+
+# Authenticate with your API key in the Authorization header (no "Bearer" prefix).
+# This script runs server-side/locally, so the key is never exposed in a URL.
+# For browser clients, generate a temporary token with GET /v3/token instead.
+AAI_HEADERS = {"Authorization": ASSEMBLYAI_API_KEY}
 
 SYSTEM_PROMPT = (
     "You are a helpful voice assistant. Keep every response under 2–3 sentences. "
@@ -66,7 +80,7 @@ class VoiceAgent:
     # ── Microphone input ───────────────────────────────────────────────────
 
     def start_mic(self):
-        """Capture mic audio into queue using sounddevice."""
+        """Capture mic audio into a queue using sounddevice."""
 
         def callback(indata: np.ndarray, frames: int, time, status):
             if status:
@@ -92,10 +106,9 @@ class VoiceAgent:
     # ── AssemblyAI WebSocket ───────────────────────────────────────────────
 
     async def send_audio(self, ws):
-        """Drain the mic queue and forward PCM bytes to AssemblyAI."""
+        """Drain the mic queue and forward raw PCM bytes to AssemblyAI."""
         loop = asyncio.get_event_loop()
         while True:
-            # Non-blocking get with asyncio-compatible sleep
             try:
                 chunk = await loop.run_in_executor(
                     None, lambda: self.audio_queue.get(timeout=0.05)
@@ -108,33 +121,38 @@ class VoiceAgent:
         """Receive turn transcripts from AssemblyAI and respond."""
         async for raw in ws:
             msg = json.loads(raw)
-            msg_type = msg.get("message_type") or msg.get("type", "")
+            msg_type = msg.get("type", "")
 
             if msg_type == "Begin":
-                session_id = msg.get("id", "unknown")
-                print(f"✅ AssemblyAI session: {session_id}\n")
+                applied = msg.get("configuration", {}) or {}
+                model = applied.get("model")
+                print(f"✅ AssemblyAI session: {msg.get('id', 'unknown')}")
+                # Bad/misspelled query params are ignored, not rejected —
+                # so confirm the model that was actually applied.
+                if model != SPEECH_MODEL:
+                    print(f"⚠️  Expected {SPEECH_MODEL}, got {model}")
+                print()
 
             elif msg_type == "Turn":
                 transcript = msg.get("transcript", "").strip()
                 end_of_turn = msg.get("end_of_turn", False)
 
                 if transcript:
-                    # Show partial transcripts in grey
                     print(f"\r👤 {transcript}", end="", flush=True)
 
                 if end_of_turn and transcript:
-                    print()  # newline after partial
-                    await self.handle_turn(transcript)
+                    print()  # newline after the rolling partial
+                    await self.handle_turn(ws, transcript)
 
             elif msg_type == "Termination":
                 print("\n🔇 Session terminated")
                 break
 
-    async def handle_turn(self, user_text: str):
-        """Generate LLM response and speak it."""
+    async def handle_turn(self, ws, user_text: str):
+        """Generate an LLM response, speak it, and feed it back as agent_context."""
         self.conversation.append({"role": "user", "content": user_text})
 
-        # ── LLM ─────────────────────────────────────────────────────────
+        # ── LLM ──────────────────────────────────────────────────────────
         response = await self.openai.chat.completions.create(
             model="gpt-4o",
             messages=self.conversation,
@@ -145,13 +163,19 @@ class VoiceAgent:
         self.conversation.append({"role": "assistant", "content": reply})
         print(f"🤖 {reply}\n")
 
-        # ── TTS ──────────────────────────────────────────────────────────
+        # ── Feed the reply back as context for the user's NEXT turn ────────
+        # Universal-3.5 Pro uses this to hear short/ambiguous replies and
+        # spelled-out entities (emails, IDs) in the context of what the
+        # agent just asked. Each UpdateConfiguration replaces the prior value.
+        await ws.send(json.dumps({"type": "UpdateConfiguration", "agent_context": reply}))
+
+        # ── TTS ───────────────────────────────────────────────────────────
         self.is_speaking = True
         await self.speak(reply)
         self.is_speaking = False
 
     async def speak(self, text: str):
-        """Synthesise speech with ElevenLabs and play through speakers."""
+        """Synthesise speech with ElevenLabs and play it through the speakers."""
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
@@ -173,20 +197,24 @@ class VoiceAgent:
             audio_data = np.frombuffer(resp.content, dtype=np.int16).astype(np.float32) / 32768.0
             sd.play(audio_data, samplerate=SAMPLE_RATE, blocking=True)
 
-    # ── Main run loop ──────────────────────────────────────────────────────
+    # ── Main run loop ────────────────────────────────────────────────────────
 
     async def run(self):
-        print("🚀 Voice Agent — AssemblyAI Universal-3 Pro Streaming")
+        print("🚀 Voice Agent — AssemblyAI Universal-3.5 Pro Streaming")
         print("   Press Ctrl+C to quit\n")
 
         self.start_mic()
 
         try:
-            async with websockets.connect(AAI_WS_URL) as ws:
-                await asyncio.gather(
-                    self.send_audio(ws),
-                    self.receive_transcripts(ws),
-                )
+            async with websockets.connect(AAI_WS_URL, additional_headers=AAI_HEADERS) as ws:
+                try:
+                    await asyncio.gather(
+                        self.send_audio(ws),
+                        self.receive_transcripts(ws),
+                    )
+                finally:
+                    # Close the AssemblyAI session cleanly.
+                    await ws.send(json.dumps({"type": "Terminate"}))
         except KeyboardInterrupt:
             print("\n\n👋 Shutting down...")
         finally:
